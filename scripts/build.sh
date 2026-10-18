@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # FriendlyWrt 构建入口，GitHub Actions 与本地 Linux 环境共用。
 #
-# 流程：
-#   1. repo 同步 friendlywrt 源码
-#   2. 把 feeds.conf 中的 git.openwrt.org 源替换为 GitHub 源
-#   3. 组装 .config（厂商 fragments + 项目 .config）
-#   4. 按文件名顺序执行 custom-scripts/*.sh
-#   5. feeds update/install -> make defconfig
-#   6. 编译 u-boot / kernel / friendlywrt，生成 SD 与 eMMC 镜像
-#   7. 压缩镜像、导出最终 .config 到 artifacts/
+# 用法：
+#   bash scripts/build.sh [prepare|download|firmware|images|collect|all]
+#
+# 各阶段（workflow 中分开执行，便于缓存下载与 ccache）：
+#   prepare  : repo 同步源码 -> 替换 feeds 源 -> 组装 .config -> 自定义脚本
+#              -> feeds update/install -> make defconfig
+#   download : make download，把源码包预下载到 work/friendlywrt/dl
+#   firmware : 编译 u-boot / kernel / friendlywrt
+#   images   : 生成 eMMC（eflasher）镜像
+#   collect  : 压缩镜像、导出最终 .config 到 artifacts/
+#   all      : 以上全部按顺序执行（本地一键构建）
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,6 +28,8 @@ BUILD_EMMC="${BUILD_EMMC:-true}"
 # 厂商配置默认打开 CONFIG_ALL_KMODS/CONFIG_ALL_NONSHARED，GitHub 托管 runner 编译时间不够，
 # 默认关闭；需要全量内核模块时设置 FULL_KMODS=1。
 FULL_KMODS="${FULL_KMODS:-0}"
+# 默认启用 ccache，配合 workflow 中的缓存显著缩短重复编译时间
+USE_CCACHE="${USE_CCACHE:-1}"
 JOBS="${JOBS:-$(nproc)}"
 
 FRIENDLYWRT_DIR="$TOP_DIR/friendlywrt"
@@ -39,6 +44,12 @@ export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-FriendlyWrt CI}"
 export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-friendlywrt-ci@users.noreply.github.com}"
 export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$GIT_AUTHOR_NAME}"
 export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
+
+if [ "$USE_CCACHE" = "1" ]; then
+    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
+    export CCACHE_COMPRESS=1
+    mkdir -p "$CCACHE_DIR"
+fi
 
 log() { printf '\033[1;32m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
@@ -126,6 +137,11 @@ prepare_config() {
     else
         warn "项目根目录没有 .config，仅使用厂商配置"
     fi
+
+    if [ "$USE_CCACHE" = "1" ]; then
+        printf '\nCONFIG_CCACHE=y\n' >>"$FRIENDLYWRT_DIR/.config"
+        log "已启用 ccache：$CCACHE_DIR"
+    fi
 }
 
 run_custom_scripts() {
@@ -175,13 +191,29 @@ expand_config() {
         || die "最终 .config 缺少 rockchip 目标配置"
 }
 
-build_all() {
+download_packages() {
+    log "预下载源码包：make download -j$JOBS"
+    (
+        cd "$FRIENDLYWRT_DIR"
+        make download -j"$JOBS"
+    ) || {
+        warn "部分源码包下载失败，串行重试一次"
+        (
+            cd "$FRIENDLYWRT_DIR"
+            make download -j1 V=s
+        ) || warn "make download 仍有失败项，编译阶段会再次尝试下载"
+    }
+}
+
+build_firmware() {
     log "开始编译 FriendlyWrt（BOARD=$BOARD）"
     (
         cd "$TOP_DIR"
         ./build.sh "$BOARD"
     ) || die "FriendlyWrt 编译失败"
+}
 
+build_images() {
     case "${BUILD_EMMC,,}" in
     true | 1 | yes | y)
         log "生成 eMMC 刷机镜像（eflasher）"
@@ -234,7 +266,21 @@ collect_artifacts() {
     ls -lh "$ARTIFACT_DIR"
 }
 
-main() {
+usage() {
+    cat <<'EOF'
+用法: bash scripts/build.sh [阶段]
+
+阶段:
+  prepare    同步源码、替换 feeds 源、组装 .config、执行 custom-scripts、feeds 与 defconfig
+  download   make download，预下载源码包到 work/friendlywrt/dl
+  firmware   编译 u-boot / kernel / friendlywrt
+  images     生成 eMMC（eflasher）镜像
+  collect    压缩镜像、导出 config.txt 到 artifacts/
+  all        依次执行以上全部阶段（默认）
+EOF
+}
+
+stage_prepare() {
     log "MANIFEST_BRANCH=$MANIFEST_BRANCH MANIFEST_XML=$MANIFEST_XML BOARD=$BOARD BUILD_EMMC=$BUILD_EMMC FULL_KMODS=$FULL_KMODS"
     download_sources
     rewrite_feeds
@@ -242,9 +288,31 @@ main() {
     run_custom_scripts
     update_feeds
     expand_config
-    build_all
-    collect_artifacts
-    log "全部完成"
+}
+
+main() {
+    local stage="${1:-all}"
+    case "$stage" in
+    prepare) stage_prepare ;;
+    download) download_packages ;;
+    firmware) build_firmware ;;
+    images) build_images ;;
+    collect) collect_artifacts ;;
+    all)
+        stage_prepare
+        download_packages
+        build_firmware
+        build_images
+        collect_artifacts
+        log "全部完成"
+        ;;
+    -h | --help | help)
+        usage
+        ;;
+    *)
+        die "未知阶段：$stage（可用：prepare download firmware images collect all）"
+        ;;
+    esac
 }
 
 main "$@"

@@ -128,8 +128,52 @@ jobs:
           git config --global user.email "friendlywrt-ci@users.noreply.github.com"
           git config --global color.ui false
 
-      - name: 编译并打包
-        run: bash scripts/build.sh
+      - name: 恢复源码包缓存（dl）
+        id: cache-dl
+        uses: actions/cache/restore@v4
+        with:
+          path: work/friendlywrt/dl
+          key: fw-dl-${{ env.MANIFEST_BRANCH }}-${{ hashFiles('.config', 'custom-scripts/**/*.sh') }}
+          restore-keys: |
+            fw-dl-${{ env.MANIFEST_BRANCH }}-
+
+      - name: 准备源码与配置
+        run: bash scripts/build.sh prepare
+
+      - name: 预下载源码包
+        run: bash scripts/build.sh download
+
+      - name: 保存源码包缓存（dl）
+        if: always() && steps.cache-dl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/friendlywrt/dl
+          key: fw-dl-${{ env.MANIFEST_BRANCH }}-${{ hashFiles('.config', 'custom-scripts/**/*.sh') }}
+
+      - name: 恢复 ccache
+        id: cache-ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: fw-ccache-${{ env.MANIFEST_BRANCH }}-${{ hashFiles('.config', 'custom-scripts/**/*.sh') }}
+          restore-keys: |
+            fw-ccache-${{ env.MANIFEST_BRANCH }}-
+
+      - name: 编译固件
+        run: bash scripts/build.sh firmware
+
+      - name: 保存 ccache
+        if: always() && steps.cache-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: fw-ccache-${{ env.MANIFEST_BRANCH }}-${{ hashFiles('.config', 'custom-scripts/**/*.sh') }}
+
+      - name: 生成 eMMC 镜像
+        run: bash scripts/build.sh images
+
+      - name: 收集产物
+        run: bash scripts/build.sh collect
 
       - name: 生成 Release 标签
         id: release
